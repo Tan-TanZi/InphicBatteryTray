@@ -6,6 +6,12 @@ A **taskbar battery indicator** for INPHIC wireless mice. By [@Tan-TanZi](https:
 
 No driver patching, no DLL injection into the vendor software, no writes to the device — it only listens to the battery report the mouse already broadcasts every 2 seconds, and paints it in the notification area.
 
+In the actual notification area:
+
+![In the tray](assets/a1.png)
+
+At different charge levels:
+
 ![Battery levels](assets/preview-levels.png)
 
 ---
@@ -168,15 +174,7 @@ Edit these in `src/InphicBatteryTray.cs` and rebuild:
 | Supported VID/PID | `Candidates` array |
 | Reporting assumption | keep `OfflineAfterMs` ≥ 4× the report interval |
 
-Supported VID/PID pairs (recovered from the vendor software's enumeration list):
-
-```
-1D57:FA60   1D57:FA65
-045E:0095   045E:0090   045E:0093   045E:0099
-045E:0098   045E:0273   045E:0271
-```
-
-`045E` is Microsoft's VID — many Chinese peripherals use it as a generic receiver identifier.
+The full device-matching list lives in the `Candidates` array in the source (9 VID/PID pairs, covering the 7 models the vendor software enumerates plus 2 self-branded VIDs).
 
 ---
 
@@ -196,7 +194,7 @@ This was a hard constraint during development too: every diagnostic sniffer used
 
 ## Known limitations
 
-1. **Tested on exactly one device** (`1D57:FA65`, product string `Inphic KP 8K`). The other VID/PID pairs come from the vendor's enumeration list and are **not hardware-verified** — they may not work.
+1. **Tested on exactly one device** (INPHIC **IN10**). The other VID/PID pairs come from the vendor's enumeration list and are **not hardware-verified** — they may not work.
 2. **Battery resolution is 1% at the hardware level.** No decimals, no voltage, no health data. Showing `87.3%` would require fabricating it through interpolation, which this project deliberately does not do.
 3. **Reporting rate cannot be configured.** The 2-second cadence is baked into firmware; the host-side protocol has no "set report interval" command.
 4. **Offline is a guess via timeout** (8 s), because the device sends nothing on power-off. A mouse that merely dozed off could be misreported as offline.
