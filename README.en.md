@@ -2,7 +2,7 @@
 
 [中文](README.md) | [**English**](README.en.md)
 
-A **taskbar battery indicator** for INPHIC wireless mice. By [@Tan-TanZi](https://github.com/Tan-TanZi).
+A **taskbar battery indicator** for INPHIC wireless mice. Supports both **IN10** (device pushes reports) and **IN9** (host queries a Feature Report). 
 
 No driver patching, no DLL injection into the vendor software, no writes to the device — it only listens to the battery report the mouse already broadcasts every 2 seconds, and paints it in the notification area.
 
@@ -34,7 +34,8 @@ Windows' built-in "Bluetooth device battery" does not work for mice paired throu
 | Connection type | `USB` / `Bluetooth (BLE)` shown in details |
 | Detail popup | Non-modal, never steals focus, auto-dismisses after 4 s |
 | Autostart | Registry run key, toggleable from the tray menu |
-| Multi-device | Scans 9 VID/PID pairs, several mice can be shown at once |
+| Multi-device | IN10 scans 9 VID/PID pairs; IN9 scans `248A` — both generations coexist |
+| Dual protocol | IN10 listens to Input Reports; IN9 polls a Feature Report (`0x0C`) |
 | Zero dependencies | Single exe, no .NET SDK or runtime install required |
 
 ### Tray states
@@ -137,6 +138,49 @@ The tray icon is rasterised at runtime with GDI+, not shipped as a fixed image:
 
 That is what keeps it recognisable as a mouse at 16×16 instead of a coloured blob.
 
+### IN9 series (a different protocol entirely)
+
+IN9 and IN10 share nothing — not even the transport:
+
+| Item | IN10 | IN9 |
+|---|---|---|
+| Transport | Input Report, device pushes | **Feature Report** (`HidD_SetFeature` / `HidD_GetFeature`) |
+| Report ID | `0x03` (status) / `0x04` (config) | **`0x0C`** |
+| Frame | 5 bytes | **33 bytes** |
+| Battery source | passive, every 2 s | **host sends `0x20`** |
+| Battery offset | 5th byte | response `buf[0x12]` |
+| VID/PID | `1D57` / `045E`, 9 pairs | `248A:5B2E` (wired) / `248A:5B2F` (2.4G) |
+
+Frame layout:
+
+```
+[0]     0x0C      report ID
+[1]     0x01      fixed
+[2]     command   0x20 = query battery, 0xF0 = handshake
+[3]     0x00
+[4]     sequence (increments)
+[5..]   payload
+```
+
+- Handshake: `0C 01 F0 00 <seq> 01 01 FF` (write only)
+- Query: `0C 01 20 00 <seq> 00 00` → wait 10 ms → read back 33 bytes
+
+Response:
+
+| Offset | Meaning |
+|---|---|
+| `[2]` | `0x20` command echo |
+| `[6]` | `!= 0` means a valid response |
+| `[8..0x0B]` | model magic (e.g. `"M909"`) |
+| `[0x0F]` | IC type |
+| `[0x12]` | **battery 0–100** |
+| `[0x13]` | `2` = charging |
+| `[0x15]` | online flag |
+
+> The frame layout and response offsets come from the derivative project [InphicBatteryTray-IN9](https://github.com/MRXie-zf/InphicBatteryTray-IN9), reverse-engineered from the vendor's `Inphic IN9 GM.exe` and verified on real hardware.
+
+Device matching: `VID == 248A` with **Feature report length ≥ 33** (not MI_02). The two scan paths are independent and can run side by side.
+
 ---
 
 ## Build
@@ -194,17 +238,22 @@ This was a hard constraint during development too: every diagnostic sniffer used
 
 ## Known limitations
 
-1. **Tested on exactly one device** (INPHIC **IN10**). The other VID/PID pairs come from the vendor's enumeration list and are **not hardware-verified** — they may not work.
+1. **Model coverage**: IN10 verified on `Inphic KP 8K`; IN9 implemented against the hardware-verified protocol of the IN9 refresh (`248A:5B2E` / `248A:5B2F`). Other INPHIC models (IN10 Pro / IN6 …) are unverified and may not read.
 2. **Battery resolution is 1% at the hardware level.** No decimals, no voltage, no health data. Showing `87.3%` would require fabricating it through interpolation, which this project deliberately does not do.
-3. **Reporting rate cannot be configured.** The 2-second cadence is baked into firmware; the host-side protocol has no "set report interval" command.
+3. **Reporting rate cannot be configured.** IN10's 2 s cadence is baked into firmware; IN9's 2.5 s poll interval is chosen by the app. Neither generation exposes a "set interval" command.
 4. **Offline is a guess via timeout** (8 s), because the device sends nothing on power-off. A mouse that merely dozed off could be misreported as offline.
 5. Fine badge/detail is lost at 16×16 — that is the physical limit of tray icons.
+
+### Battery not detected?
+
+The app writes `tray.log` next to the executable (rotated at 512 KB), recording enumerated interfaces, raw send/receive bytes and parse results. Attach it to an issue and the cause is usually obvious.
 
 ---
 
 ## Credits
 
-- [RuiShu1024/InphicMouse](https://github.com/RuiShu1024/InphicMouse) — a protocol reconstruction of the same vendor's IN9 series. The two generations are not wire-compatible (IN9 uses 33-byte checksummed frames; this device uses 5-byte reports), but it confirmed the vendor's overall design and the "connection mode is inferred from VID" approach.
+- [**MRXie-zf/InphicBatteryTray-IN9**](https://github.com/MRXie-zf/InphicBatteryTray-IN9) — the IN9 derivative of this project, and **the sole basis for IN9 support in v1.1.0**. They reverse-engineered the real Feature Report protocol from the vendor's `Inphic IN9 GM.exe` (report ID `0x0C`, command `0x20`, battery at `buf[0x12]`) and verified it on hardware. If you want richer IN9 features (low-battery toast, `--probe` diagnostics), use their build directly.
+- [RuiShu1024/InphicMouse](https://github.com/RuiShu1024/InphicMouse) — an earlier protocol reconstruction of the same vendor's IN9 series, useful for understanding the vendor's communication design (notably that connection mode is inferred from VID).
 
 ---
 
