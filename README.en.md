@@ -1,10 +1,37 @@
-# Inphic Battery Tray
+# INPHIC / ATK Battery Tray
 
 [中文](README.md) | [**English**](README.en.md)
 
-A **taskbar battery indicator** for INPHIC wireless mice. Supports both **IN10** (device pushes reports) and **IN9** (host queries a Feature Report). 
+A **taskbar battery indicator** for wireless mice. Supports INPHIC **IN10** (device pushes reports), **IN9** (host queries a Feature Report), and **ATK X1 Pro with its 1K receiver** (Output/Input Report queries).
 
-No driver patching, no DLL injection into the vendor software, no writes to the device — it only listens to the battery report the mouse already broadcasts every 2 seconds, and paints it in the notification area.
+No driver patching, DLL injection, or device configuration changes. IN10 listens for battery updates; IN9 and ATK send battery queries, then display valid readings in the notification area.
+
+### ATK X1 Pro support in this branch
+
+- Real battery readings, tray refresh, reopening details, second-instance exit and fresh readings after a rescan have been checked with an X1 Pro and its **1K receiver `373B:101A`**.
+- Queries run about **2.5 seconds** after each valid reply. Report length, command, percentage range and checksum are validated. After 8 seconds without valid data, the icon greys out and retains the last reading.
+- Only the 17-byte vendor battery collection, `Usage Page 0xFF02 / Usage 0x0002`, is accessed; no mouse movement or keystrokes are read.
+- A second launch exits immediately to prevent duplicate polling. Manual rescans wake the supervisor and reopen interfaces after old reads finish; receivers of the same model keep separate states.
+- The charging flag was checked on hardware while powered by a charger, after unplugging the charging cable, and after reconnecting it. It is read through the 1K receiver. The tooltip and details show charging; unplugging clears it. Unknown flags stay unknown, and 100% alone does not imply charging is complete.
+- Idle timeouts have been checked: the icon greys out and keeps the last reading. The tooltip says "no response" rather than treating sleep as a confirmed power-off; stale charging data is marked as the last recorded state in details. USB wired data mode, 8K receivers, Bluetooth and other ATK models are not supported. Power-off, receiver unplug/replug, sleep recovery and coexistence with ATK HUB have not been checked on hardware.
+- Build this branch and run `InphicBatteryTray.exe`; the upstream release binary does not include this adaptation.
+
+Run checks without a test framework:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
+# Also query real hardware three times, with the receiver connected and mouse awake:
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1 -Probe
+```
+
+To collect calibration data, exit the existing tray first, then run:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\InphicBatteryTray" | Out-Null
+.\InphicBatteryTray.exe "--calibration=$env:LOCALAPPDATA\InphicBatteryTray\atk-calibration.csv"
+```
+
+This optional flag records validated ATK replies: UTC date/time, receiver path, raw percentage, charging flag, millivolts and raw packet. It changes neither the displayed percentage nor device settings. The CSV is append-only and is separate from the bounded diagnostic log; continuous replies use roughly 10 MB/day. Exit to stop recording and restart without the flag to disable it. Data stays in the specified local file and is never uploaded automatically. Charging percentages can jump with cable and voltage changes; this capture feature does not yet provide validated battery compensation.
 
 In the actual notification area:
 
@@ -31,20 +58,20 @@ Windows' built-in "Bluetooth device battery" does not work for mice paired throu
 | Battery icon | Mouse silhouette filled from the bottom up |
 | Colors | Teal `#19fac6` (>40%) / yellow (16–40%) / red (≤15%) |
 | Offline detection | No report for 8 s → whole icon greys out, hover still shows the last known level |
-| Connection type | `USB` / `Bluetooth (BLE)` shown in details |
+| Connection type | `USB` / `Bluetooth (BLE)` shown in details; ATK identifies the 2.4G receiver |
 | Detail popup | Non-modal, never steals focus, auto-dismisses after 4 s |
 | Autostart | Registry run key, toggleable from the tray menu |
-| Multi-device | IN10 scans 9 VID/PID pairs; IN9 scans `248A` — both generations coexist |
-| Dual protocol | IN10 listens to Input Reports; IN9 polls a Feature Report (`0x0C`) |
+| Multi-device | IN10 scans 9 VID/PID pairs; IN9 scans `248A` / `249A`; ATK matches `373B:101A` |
+| Battery protocols | IN10 listens; IN9 polls Feature Reports (`0x0C`); ATK uses Output/Input Reports (`0x08` / `0x04`) |
 | Zero dependencies | Single exe, no .NET SDK or runtime install required |
 
 ### Tray states
 
 | State | Icon | Tooltip |
 |-------|------|---------|
-| Online | Teal fill proportional to charge | `INPHIC 87% (2000ms refresh)` |
-| Offline | Entirely greyed out | `INPHIC: disconnected / powered off (last 87%, 21:12:03)` |
-| Not detected | Greyed out | `INPHIC: no device detected` |
+| Online | Fill proportional to charge, colored by threshold | `鼠标电量 87% (2000ms 刷新)` |
+| Offline | Entirely greyed out | `鼠标：暂无回应（最后 87%，21:12:03）` |
+| Not detected | Greyed out | `鼠标电量：未检测到设备` |
 
 ---
 
@@ -90,21 +117,21 @@ Battery lives on the `Usage Page 0x000A` interface (not the 64-byte vendor chann
 
 ```
 offset 0        1             2           3          4
-       0x03     device type   subcommand  device #   payload
+       0x03     device type   subcommand  status     payload
 ```
 
 | Byte | Meaning |
 |------|---------|
 | `[0]` | Always `0x03` (Report ID) |
 | `[1]` | Device type code: `0x95` / `0x90` / `0x93` / `0x99` / `0x98` / `0x73` |
-| `[2]` | Subcommand: `0x10` connection/device#, `0x20` status, `0x40` **battery**, `0x50` charging |
-| `[3]` | Device number `1..7` |
+| `[2]` | Subcommand: `0x10` connection/device#, `0x20` status, `0x40` / `0x41` **battery**, `0x50` charging |
+| `[3]` | Battery-event status; the app interprets `1` as not charging, `2` as full and `3` as charging |
 | `[4]` | Payload — battery percentage `0..100` |
 
 Captured sample:
 
 ```
-03 98 40 01 64     →  device type 0x98, battery report, device #1, 0x64 = 100%
+03 98 40 01 64     →  device type 0x98, battery report, status 1, 0x64 = 100%
 ```
 
 ### Reporting behaviour (measured)
@@ -179,7 +206,7 @@ Response:
 
 > The frame layout and response offsets come from the derivative project [InphicBatteryTray-IN9](https://github.com/MRXie-zf/InphicBatteryTray-IN9), reverse-engineered from the vendor's `Inphic IN9 GM.exe` and verified on real hardware.
 
-Device matching: `VID == 248A` with **Feature report length ≥ 33** (not MI_02). The two scan paths are independent and can run side by side.
+Device matching: VID `248A` / `249A` with **Feature report length ≥ 33**, excluding Generic Desktop / Keyboard input collections rather than relying on an MI number. IN10 listens only on `Usage Page 0x000A`; ATK uses its dedicated vendor battery collection.
 
 ---
 
@@ -227,9 +254,10 @@ The full device-matching list lives in the `Candidates` array in the source (9 V
 Read-only, and deliberately avoids user input:
 
 - ✅ Reads: battery reports on the status channel (`Usage Page 0x000A`)
+- ✅ Queries: IN9 Feature Reports and the ATK vendor battery collection (`08 04 … 49`), without changing settings
 - ✅ Reads: HID metadata (VID/PID, product string)
 - ❌ **Never reads** any `Usage Page 0x0001` (Generic Desktop) interface — that is the keyboard and mouse proper, where keystrokes and movement live
-- ❌ Sends no reports, writes nothing to the device, changes no settings
+- ❌ Changes no device settings (DPI, lighting, key mappings or firmware)
 - ❌ No network access, no telemetry
 
 This was a hard constraint during development too: every diagnostic sniffer used while reverse-engineering explicitly filtered out keyboard/mouse interfaces.
@@ -239,19 +267,20 @@ This was a hard constraint during development too: every diagnostic sniffer used
 ## Known limitations
 
 1. **Model coverage**: IN10 verified on `Inphic KP 8K`; IN9 implemented against the hardware-verified protocol of the IN9 refresh (`248A:5B2E` / `248A:5B2F`). Other INPHIC models (IN10 Pro / IN6 …) are unverified and may not read.
-2. **Battery resolution is 1% at the hardware level.** No decimals, no voltage, no health data. Showing `87.3%` would require fabricating it through interpolation, which this project deliberately does not do.
+2. **Only the device's integer percentage is displayed.** No interpolation, voltage display or health data. INPHIC battery reports contain no voltage field; extra ATK report fields are not used for the tray display.
 3. **Reporting rate cannot be configured.** IN10's 2 s cadence is baked into firmware; IN9's 2.5 s poll interval is chosen by the app. Neither generation exposes a "set interval" command.
 4. **Offline is a guess via timeout** (8 s), because the device sends nothing on power-off. A mouse that merely dozed off could be misreported as offline.
 5. Fine badge/detail is lost at 16×16 — that is the physical limit of tray icons.
 
 ### Battery not detected?
 
-The app writes `tray.log` next to the executable (rotated at 512 KB), recording enumerated interfaces, raw send/receive bytes and parse results. Attach it to an issue and the cause is usually obvious.
+The app writes `tray.log` next to the executable. During normal operation, a log larger than 512 KB starts afresh with the next entry. It records enumerated interfaces, received bytes and parse results, and no longer exports icon images automatically. A sleeping ATK mouse may not answer queries; move it to wake it before checking again. Provide the log when asking for diagnosis.
 
 ---
 
 ## Credits
 
+- [Fan4Metal/mouse_tray](https://github.com/Fan4Metal/mouse_tray/blob/master/mouse_tray/drivers/chipset/nordic52.py) — reference for the ATK / Compx 17-byte battery query protocol, additionally checked here on an X1 Pro 1K receiver.
 - [**MRXie-zf/InphicBatteryTray-IN9**](https://github.com/MRXie-zf/InphicBatteryTray-IN9) — the IN9 derivative of this project, and **the sole basis for IN9 support in v1.1.0**. They reverse-engineered the real Feature Report protocol from the vendor's `Inphic IN9 GM.exe` (report ID `0x0C`, command `0x20`, battery at `buf[0x12]`) and verified it on hardware. If you want richer IN9 features (low-battery toast, `--probe` diagnostics), use their build directly.
 - [RuiShu1024/InphicMouse](https://github.com/RuiShu1024/InphicMouse) — an earlier protocol reconstruction of the same vendor's IN9 series, useful for understanding the vendor's communication design (notably that connection mode is inferred from VID).
 
@@ -259,7 +288,7 @@ The app writes `tray.log` next to the executable (rotated at 512 KB), recording 
 
 ## Disclaimer
 
-Unofficial third-party tool, not affiliated with INPHIC.
+Unofficial third-party tool, not affiliated with INPHIC or ATK.
 
 Protocol details were obtained by statically reverse-engineering `INPHIC HUB 1.0.1.19` plus live capture, for interoperability purposes only. The program itself is read-only and modifies neither the device nor the vendor software. Use at your own risk.
 

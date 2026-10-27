@@ -4,9 +4,9 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-$csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+$csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $csc)) {
-    $csc = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 }
 if (-not (Test-Path $csc)) {
     throw "找不到 csc.exe，请确认已安装 .NET Framework 4.x"

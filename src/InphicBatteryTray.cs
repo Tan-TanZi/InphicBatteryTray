@@ -1,5 +1,5 @@
-// InphicBatteryTray.cs  —  英菲克鼠标电量托盘显示器
-// 纯只读：不修改设备、不修改 INPHIC HUB，仅接收设备主动上报的电量报告。
+// InphicBatteryTray.cs  —  INPHIC / ATK 鼠标电量托盘显示器
+// 接收或查询电量，不修改设备配置、固件或原厂软件。
 //
 // 图标：由 鼠标.svg 渲染的剪影，按电量从下往上填充，颜色随电量变化。
 //
@@ -95,11 +95,11 @@ namespace InphicBatteryTray
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr hObject);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool ReadFile(IntPtr hFile, byte[] buffer, int numberOfBytesToRead, out int numberOfBytesRead, IntPtr lpOverlapped);
+        [DllImport("kernel32.dll", EntryPoint = "ReadFile", SetLastError = true)]
+        public static extern bool ReadFileBuffer(IntPtr hFile, IntPtr buffer, int numberOfBytesToRead, out int numberOfBytesRead, IntPtr lpOverlapped);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool WriteFile(IntPtr hFile, byte[] buffer, int numberOfBytesToWrite, out int numberOfBytesWritten, IntPtr lpOverlapped);
+        [DllImport("kernel32.dll", EntryPoint = "WriteFile", SetLastError = true)]
+        public static extern bool WriteFileBuffer(IntPtr hFile, IntPtr buffer, int numberOfBytesToWrite, out int numberOfBytesWritten, IntPtr lpOverlapped);
 
         [DllImport("hid.dll", SetLastError = true)]
         public static extern bool HidD_GetPreparsedData(IntPtr hidDeviceObject, out IntPtr preparsedData);
@@ -126,9 +126,6 @@ namespace InphicBatteryTray
         public static extern bool GetOverlappedResult(IntPtr hFile, IntPtr lpOverlapped, out int lpNumberOfBytesTransferred, bool bWait);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool ResetEvent(IntPtr hEvent);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -143,6 +140,9 @@ namespace InphicBatteryTray
         public string Product;
         public string Transport;   // USB / 蓝牙
         public bool IsIn9;         // IN9 系列：需要主动查询
+        public bool IsAtk;
+        public ushort UsagePage;
+        public ushort Usage;
         public int InLen;          // 输入报告长度
         public int OutLen;         // 输出报告长度
         public int FeatLen;        // Feature 报告长度
@@ -155,7 +155,7 @@ namespace InphicBatteryTray
         public double LastIntervalMs;
         public DateTime LastSeen = DateTime.MinValue;
         public int ChargeState = -1;   // 1 正常 / 2 已满 / 3 充电
-        public string Protocol;        // "IN10 push" / "IN9 query"
+        public string Protocol;        // "IN10 push" / "IN9 query" / "ATK query"
         public string Product;
         public ushort Vid;
         public ushort Pid;
@@ -238,6 +238,8 @@ namespace InphicBatteryTray
                                     byte[] caps = new byte[256];
                                     if (Native.HidP_GetCaps(pp, caps) == 0x00110000)
                                     {
+                                        dev.Usage = BitConverter.ToUInt16(caps, 0);
+                                        dev.UsagePage = BitConverter.ToUInt16(caps, 2);
                                         dev.InLen = BitConverter.ToUInt16(caps, 4);
                                         dev.OutLen = BitConverter.ToUInt16(caps, 6);
                                         dev.FeatLen = BitConverter.ToUInt16(caps, 8);
@@ -283,6 +285,8 @@ namespace InphicBatteryTray
         static NotifyIcon tray;
         static Icon currentIcon;
         static string logPath = null;
+        static string calibrationPath;
+        static readonly object logSync = new object();
         static Bitmap srcIcon = null;
         static MenuItem autoItem;
         static int lastDrawnLevel = -999;
@@ -300,20 +304,35 @@ namespace InphicBatteryTray
         static void Log(string s)
         {
             if (logPath == null) return;
-            try
+            lock (logSync)
             {
-                File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\r\n");
+                try
+                {
+                    if (File.Exists(logPath) && new FileInfo(logPath).Length > 512 * 1024)
+                        File.WriteAllText(logPath, string.Empty);
+                    File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + "\r\n");
+                }
+                catch { }
             }
-            catch { }
         }
 
         [STAThread]
-        static void Main(string[] args)
+        internal static void Main(string[] args)
+        {
+            bool first;
+            using (var instance = new Mutex(true, @"Local\InphicBatteryTray", out first))
+            {
+                if (first) Run(args);
+            }
+        }
+
+        static void Run(string[] args)
         {
             logPath = Environment.GetEnvironmentVariable("INPHIC_TRAY_LOG");
             foreach (string a in args)
             {
                 if (a.StartsWith("--log=")) logPath = a.Substring(6);
+                if (a.StartsWith("--calibration=")) calibrationPath = a.Substring(14);
             }
             if (logPath == null)
             {
@@ -322,8 +341,6 @@ namespace InphicBatteryTray
                 {
                     string dir = Path.GetDirectoryName(Application.ExecutablePath);
                     logPath = Path.Combine(dir, "tray.log");
-                    if (File.Exists(logPath) && new FileInfo(logPath).Length > 512 * 1024)
-                        File.Delete(logPath);          // 超过 512KB 就换新的
                 }
                 catch { logPath = null; }
             }
@@ -335,8 +352,9 @@ namespace InphicBatteryTray
             LoadIconSource();
 
             tray = new NotifyIcon();
-            tray.Text = "英菲克 电量：搜索设备中…";
-            tray.Icon = DrawIcon(-1, true);
+            tray.Text = "鼠标电量：搜索设备中…";
+            currentIcon = DrawIcon(-1, true);
+            tray.Icon = currentIcon;
             tray.Visible = true;
 
             var menu = new ContextMenu();
@@ -371,14 +389,24 @@ namespace InphicBatteryTray
                 testTimer.Interval = 2500;
                 testTimer.Tick += delegate
                 {
-                    testTimer.Stop();
+                    testTimer.Dispose();
                     try { ShowDetails(); Log("test popup shown"); }
                     catch (Exception ex) { Log("test popup FAILED: " + ex); }
                 };
                 testTimer.Start();
             }
 
-            Application.Run();
+            try { Application.Run(); }
+            finally
+            {
+                running = false;
+                Rescan();
+                statusTimer.Dispose();
+                if (popup != null) popup.Dispose();
+                tray.Dispose();
+                if (currentIcon != null) currentIcon.Dispose();
+                if (srcIcon != null) srcIcon.Dispose();
+            }
         }
 
         // ---------------------------------------------------------- 开机自启
@@ -409,7 +437,7 @@ namespace InphicBatteryTray
                 {
                     if (k == null)
                     {
-                        MessageBox.Show("无法打开启动项注册表键。", "英菲克 电量",
+                        MessageBox.Show("无法打开启动项注册表键。", "鼠标电量",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         return;
                     }
@@ -423,7 +451,7 @@ namespace InphicBatteryTray
             }
             catch (Exception ex)
             {
-                MessageBox.Show("设置开机自启动失败：" + ex.Message, "英菲克 电量",
+                MessageBox.Show("设置开机自启动失败：" + ex.Message, "鼠标电量",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
@@ -560,15 +588,6 @@ namespace InphicBatteryTray
                     IntPtr hIcon = outp.GetHicon();
                     try
                     {
-                        // 调试：把实际生成的图标存一份，便于核对视觉
-                        if (logPath != null)
-                        {
-                            try
-                            {
-                                outp.Save(logPath + ".icon.png", ImageFormat.Png);
-                            }
-                            catch { }
-                        }
                         using (Icon tmp = Icon.FromHandle(hIcon))
                             return (Icon)tmp.Clone();
                     }
@@ -584,30 +603,45 @@ namespace InphicBatteryTray
 
         static void Quit()
         {
-            running = false;
-            if (tray != null) { tray.Visible = false; tray.Dispose(); }
             Application.Exit();
         }
 
-        static void Rescan()
+        internal static void Rescan()
         {
-            List<Thread> ts = readersSnapshot();
-            lock (readerThreads) readerThreads.Clear();
-            lock (activePaths) activePaths.Clear();
-            foreach (Thread t in ts)
-            {
-                try { t.Interrupt(); } catch { }
-            }
+            Interlocked.Increment(ref readerGeneration);
+            scanRequested.Set();
         }
 
-        static List<Thread> readerThreads = new List<Thread>();
-        // 已建立读取连接的接口路径，防止每轮枚举重复打开
-        static readonly HashSet<string> activePaths =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        static readonly Dictionary<string, Thread> readerThreads =
+            new Dictionary<string, Thread>(StringComparer.OrdinalIgnoreCase);
+        static readonly AutoResetEvent scanRequested = new AutoResetEvent(false);
+        static int readerGeneration;
 
-        static List<Thread> readersSnapshot()
+        internal static void StartReader(HidInterface dev)
         {
-            lock (readerThreads) return new List<Thread>(readerThreads);
+            lock (readerThreads)
+            {
+                if (!running || readerThreads.ContainsKey(dev.Path)) return;
+                int generation = readerGeneration;
+                var thread = new Thread(delegate ()
+                {
+                    try
+                    {
+                        if (dev.IsAtk) AtkQueryLoop(dev, generation);
+                        else if (dev.IsIn9) In9QueryLoop(dev, generation);
+                        else ReadLoop(dev, generation);
+                    }
+                    finally
+                    {
+                        lock (readerThreads) readerThreads.Remove(dev.Path);
+                        if (generation != Thread.VolatileRead(ref readerGeneration)) scanRequested.Set();
+                    }
+                });
+                thread.IsBackground = true;
+                readerThreads.Add(dev.Path, thread);
+                try { thread.Start(); }
+                catch { readerThreads.Remove(dev.Path); throw; }
+            }
         }
 
         static string ChargeText(int c)
@@ -628,7 +662,7 @@ namespace InphicBatteryTray
             {
                 if (states.Count == 0)
                 {
-                    msg = "尚未收到任何电量上报。\n\n请确认：\n· 设备已连接并唤醒\n· 原程序不是独占状态（本工具为只读共享）";
+                    msg = "尚未读取到电量。\n\n请确认：\n· 鼠标已连接并唤醒\n· 必要时关闭原厂驱动界面后重新扫描";
                 }
                 else
                 {
@@ -645,10 +679,11 @@ namespace InphicBatteryTray
                             sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
                         sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
                         sb.AppendLine("  电量      : " + d.Battery + "%");
-                        sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
-                        sb.AppendLine(string.Format("  刷新间隔  : {0:F0} ms", d.LastIntervalMs));
+                        sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState) + (off ? "（最后记录）" : ""));
+                        sb.AppendLine("  刷新间隔  : " + (d.LastIntervalMs > 0
+                            ? string.Format("{0:F0} ms", d.LastIntervalMs) : "等待下一次读取"));
                         sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
-                        sb.AppendLine("  当前状态  : " + (off ? "已断开 / 已关机" : "在线"));
+                        sb.AppendLine("  当前状态  : " + (off ? "暂无回应" : "在线"));
                         sb.AppendLine();
                     }
                     msg = sb.ToString();
@@ -664,7 +699,7 @@ namespace InphicBatteryTray
         {
             if (popup != null)
             {
-                try { popup.Close(); popup.Dispose(); } catch { }
+                popup.Close();
                 popup = null;
             }
             popup = new InfoPopup(text);
@@ -684,16 +719,12 @@ namespace InphicBatteryTray
                     var targets = new List<HidInterface>();
                     foreach (HidInterface d in all)
                     {
-                        bool matched = false;
-                        foreach (ushort[] c in Candidates)
-                        {
-                            if (d.Vid == c[0] && d.Pid == c[1]) { matched = true; break; }
-                        }
-                        if (matched) { d.IsIn9 = false; targets.Add(d); continue; }
+                        if (IsAtk(d)) { d.IsAtk = true; targets.Add(d); continue; }
+                        if (IsIn10(d)) { targets.Add(d); continue; }
 
                         if (IsIn9Vid(d.Vid))
                         {
-                            bool featOk = d.FeatLen >= 33;
+                            bool featOk = IsIn9(d);
                             Log(string.Format("IN9 iface: in={0} out={1} feat={2} {3}{4}",
                                 d.InLen, d.OutLen, d.FeatLen, d.Product,
                                 featOk ? "  <- candidate" : ""));
@@ -704,38 +735,154 @@ namespace InphicBatteryTray
                     Log(string.Format("enumerate: {0} hid interfaces, {1} candidates ({2} IN9)",
                         all.Count, targets.Count, CountIn9(targets)));
 
-                    foreach (HidInterface d in targets)
-                    {
-                        HidInterface dd = d;
-                        lock (activePaths)
-                        {
-                            if (activePaths.Contains(dd.Path)) continue;
-                            activePaths.Add(dd.Path);
-                        }
-                        var t = new Thread(delegate ()
-                        {
-                            try
-                            {
-                                if (dd.IsIn9) In9QueryLoop(dd);
-                                else ReadLoop(dd);
-                            }
-                            finally
-                            {
-                                lock (activePaths) activePaths.Remove(dd.Path);
-                            }
-                        });
-                        t.IsBackground = true;
-                        t.Start();
-                        lock (readerThreads) readerThreads.Add(t);
-                    }
+                    foreach (HidInterface d in targets) StartReader(d);
 
-                    Thread.Sleep(10000);
+                    scanRequested.WaitOne(10000);
                 }
                 catch (Exception)
                 {
-                    Thread.Sleep(5000);
+                    scanRequested.WaitOne(5000);
                 }
             }
+        }
+
+        // ---------------------------------------------------------- ATK（主动查询）
+
+        internal static bool IsAtk(HidInterface dev)
+        {
+            return dev.Vid == 0x373B && dev.Pid == 0x101A &&
+                dev.UsagePage == 0xFF02 && dev.Usage == 0x0002 &&
+                dev.InLen == 17 && dev.OutLen == 17;
+        }
+
+        internal static int ParseAtkBattery(byte[] response, int count)
+        {
+            if (response == null || count != 17 || response.Length < count ||
+                response[0] != 0x08 || response[1] != 0x04 || response[6] > 100)
+                return -1;
+            int sum = 0;
+            for (int i = 0; i < count; i++) sum += response[i];
+            if ((sum & 0xFF) != 0x55) return -1;
+            return response[6];
+        }
+
+        internal static int ParseAtkCharge(byte[] response, int count)
+        {
+            if (ParseAtkBattery(response, count) < 0) return -1;
+            // 实机拔线/充电器供电对照：byte 7 为 0 / 1；不根据百分比推断充满。
+            if (response[7] == 0) return 1;
+            if (response[7] == 1) return 3;
+            return -1;
+        }
+
+        internal static void RecordAtkCalibration(HidInterface dev, byte[] response, int count)
+        {
+            if (string.IsNullOrEmpty(calibrationPath) || !IsAtk(dev) || ParseAtkBattery(response, count) < 0) return;
+            lock (logSync)
+            {
+                try
+                {
+                    bool header = !File.Exists(calibrationPath) || new FileInfo(calibrationPath).Length == 0;
+                    string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "{0:o},\"{1}\",{2},{3},{4},{5}\r\n", DateTime.UtcNow,
+                        (dev.Path ?? "").Replace("\"", "\"\""), response[6], response[7],
+                        response[8] * 256 + response[9], BitConverter.ToString(response, 0, count));
+                    File.AppendAllText(calibrationPath, (header
+                        ? "utc,device_path,battery_percent,charging_flag,voltage_mv,packet\r\n" : "") + row);
+                }
+                catch (Exception ex) { Log("ATK calibration write failed: " + ex.Message); }
+            }
+        }
+
+        internal static int QueryAtkBattery(IntPtr handle, HidInterface dev, out int charge)
+        {
+            charge = -1;
+            if (!IsAtk(dev)) return -1;
+            // ATK/Compx Nordic52 电量查询；17 字节之和为 0x55。
+            byte[] request = new byte[17];
+            request[0] = 0x08;
+            request[1] = 0x04;
+            request[16] = 0x49;
+            if (HidTransfer(handle, request, 1000, true) != request.Length)
+            {
+                Log("ATK query write failed or timed out");
+                return -1;
+            }
+
+            byte[] response = new byte[dev.InLen];
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            while (elapsed.ElapsedMilliseconds < 1500)
+            {
+                int count = HidTransfer(handle, response, (int)Math.Max(0, 1500 - elapsed.ElapsedMilliseconds), false);
+                if (count <= 0) break;
+                Log("ATK rx: " + Hex(response, count));
+                int level = ParseAtkBattery(response, count);
+                if (level >= 0)
+                {
+                    charge = ParseAtkCharge(response, count);
+                    RecordAtkCalibration(dev, response, count);
+                    return level;
+                }
+            }
+            Log("ATK no valid battery reply");
+            return -1;
+        }
+
+        static void AtkQueryLoop(HidInterface dev, int generation)
+        {
+            Log("ATK try open: " + dev.Path);
+            IntPtr handle = Native.CreateFileW(dev.Path,
+                Native.GENERIC_READ | Native.GENERIC_WRITE,
+                Native.FILE_SHARE_READ | Native.FILE_SHARE_WRITE,
+                IntPtr.Zero, Native.OPEN_EXISTING, Native.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            if (handle == Native.INVALID_HANDLE_VALUE)
+            {
+                Log("ATK open FAILED err=" + Marshal.GetLastWin32Error());
+                return;
+            }
+            try
+            {
+                int failures = 0;
+                while (running && generation == Thread.VolatileRead(ref readerGeneration))
+                {
+                    int charge;
+                    int level = QueryAtkBattery(handle, dev, out charge);
+                    if (!running || generation != Thread.VolatileRead(ref readerGeneration)) break;
+                    if (level < 0)
+                    {
+                        if (++failures >= 3) break;
+                    }
+                    else
+                    {
+                        failures = 0;
+                        lock (sync)
+                        {
+                            DeviceState state;
+                            if (!states.TryGetValue(dev.Path, out state))
+                            {
+                                state = new DeviceState();
+                                state.Label = "ATK X1 Pro (1K)";
+                                state.Product = "ATK X1 Pro / " + dev.Product;
+                                state.Protocol = "ATK query";
+                                state.Vid = dev.Vid;
+                                state.Pid = dev.Pid;
+                                state.Transport = "2.4G (USB 接收器)";
+                                states[dev.Path] = state;
+                            }
+                            DateTime now = DateTime.Now;
+                            if (state.LastSeen != DateTime.MinValue)
+                                state.LastIntervalMs = (now - state.LastSeen).TotalMilliseconds;
+                            state.Battery = level;
+                            state.ChargeState = charge;
+                            state.LastSeen = now;
+                        }
+                        Log("ATK battery " + level + "% charge=" + charge);
+                    }
+                    Thread.Sleep(2500);
+                }
+            }
+            catch (Exception ex) { Log("ATK loop exception: " + ex.Message); }
+            finally { Native.CloseHandle(handle); }
         }
 
         // ---------------------------------------------------------- IN9（主动查询）
@@ -748,6 +895,37 @@ namespace InphicBatteryTray
             for (int i = 0; i < In9Vids.Length; i++)
                 if (In9Vids[i] == vid) return true;
             return false;
+        }
+
+        internal static bool IsIn10(HidInterface dev)
+        {
+            if (dev.UsagePage != 0x000A || dev.InLen < 5) return false;
+            foreach (ushort[] candidate in Candidates)
+                if (dev.Vid == candidate[0] && dev.Pid == candidate[1]) return true;
+            return false;
+        }
+
+        internal static bool IsIn9(HidInterface dev)
+        {
+            return IsIn9Vid(dev.Vid) && dev.UsagePage != 0x0001 &&
+                dev.UsagePage != 0x0007 && dev.FeatLen >= 33;
+        }
+
+        internal static int ParseIn10Battery(byte[] response, int count)
+        {
+            if (response == null || count < 5 || count > response.Length ||
+                response[0] != 3 || !TypeCodes.Contains(response[1]) ||
+                (response[2] != 0x40 && response[2] != 0x41) || response[4] > 100)
+                return -1;
+            return response[4];
+        }
+
+        internal static int ParseIn9Battery(byte[] response)
+        {
+            if (response == null || response.Length < 33 || response[0] != 0x0C ||
+                response[1] != 1 || response[2] != 0x20 || response[6] == 0 || response[0x12] > 100)
+                return -1;
+            return response[0x12];
         }
 
         static int CountIn9(List<HidInterface> list)
@@ -782,58 +960,31 @@ namespace InphicBatteryTray
             return f;
         }
 
-        static bool HidWrite(IntPtr h, byte[] frame, int outLen)
-        {
-            if (outLen < frame.Length) outLen = frame.Length;
-            byte[] b = new byte[outLen];
-            Array.Copy(frame, b, frame.Length);
-
-            IntPtr ev = Native.CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
-            if (ev == IntPtr.Zero) return false;
-            IntPtr ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.OVERLAPPED)));
-            try
-            {
-                Native.OVERLAPPED ov = new Native.OVERLAPPED();
-                ov.hEvent = ev;
-                Marshal.StructureToPtr(ov, ovPtr, false);
-
-                int written = 0;
-                bool ok = Native.WriteFile(h, b, outLen, out written, ovPtr);
-                if (!ok && Marshal.GetLastWin32Error() != Native.ERROR_IO_PENDING) return false;
-
-                if (Native.WaitForSingleObject(ev, 1000) != Native.WAIT_OBJECT_0)
-                {
-                    Native.CancelIoEx(h, ovPtr);
-                    return false;
-                }
-                int got = 0;
-                return Native.GetOverlappedResult(h, ovPtr, out got, false);
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(ovPtr);
-                Native.CloseHandle(ev);
-            }
-        }
-
-        static int HidReadTimeout(IntPtr h, byte[] buf, int ms)
+        internal static int HidTransfer(IntPtr h, byte[] buf, int ms, bool write)
         {
             IntPtr ev = Native.CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
             if (ev == IntPtr.Zero) return -1;
-            IntPtr ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.OVERLAPPED)));
+            IntPtr ovPtr = IntPtr.Zero;
+            GCHandle pinned = new GCHandle();
+            bool pending = false;
             try
             {
+                ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.OVERLAPPED)));
+                pinned = GCHandle.Alloc(buf, GCHandleType.Pinned);
                 Native.OVERLAPPED ov = new Native.OVERLAPPED();
                 ov.hEvent = ev;
                 Marshal.StructureToPtr(ov, ovPtr, false);
 
                 int read = 0;
-                bool ok = Native.ReadFile(h, buf, buf.Length, out read, ovPtr);
-                if (!ok && Marshal.GetLastWin32Error() != Native.ERROR_IO_PENDING) return -1;
+                bool ok = write
+                    ? Native.WriteFileBuffer(h, pinned.AddrOfPinnedObject(), buf.Length, out read, ovPtr)
+                    : Native.ReadFileBuffer(h, pinned.AddrOfPinnedObject(), buf.Length, out read, ovPtr);
+                if (ok) return read;
+                if (Marshal.GetLastWin32Error() != Native.ERROR_IO_PENDING) return -1;
+                pending = true;
 
                 if (Native.WaitForSingleObject(ev, (uint)ms) != Native.WAIT_OBJECT_0)
                 {
-                    Native.CancelIoEx(h, ovPtr);
                     return 0;
                 }
                 int got = 0;
@@ -842,12 +993,20 @@ namespace InphicBatteryTray
             }
             finally
             {
-                Marshal.FreeHGlobal(ovPtr);
+                // 取消完成前，内核仍可能访问缓冲区和 OVERLAPPED。
+                if (pending)
+                {
+                    Native.CancelIoEx(h, ovPtr);
+                    int ignored;
+                    Native.GetOverlappedResult(h, ovPtr, out ignored, true);
+                }
+                if (pinned.IsAllocated) pinned.Free();
+                if (ovPtr != IntPtr.Zero) Marshal.FreeHGlobal(ovPtr);
                 Native.CloseHandle(ev);
             }
         }
 
-        static void In9QueryLoop(HidInterface dev)
+        static void In9QueryLoop(HidInterface dev, int generation)
         {
             string label = string.Format("{0:X4}:{1:X4}", dev.Vid, dev.Pid);
             Log("IN9 try open: " + dev.Path);
@@ -869,7 +1028,7 @@ namespace InphicBatteryTray
 
             try
             {
-                while (running)
+                while (running && generation == Thread.VolatileRead(ref readerGeneration))
                 {
                     // 握手（只发不收）：0C 01 F0 00 <seq> 01 01 FF
                     byte[] hs = BuildIn9Frame(0xF0, seq, new byte[] { 0x01, 0x01, 0xFF });
@@ -889,6 +1048,7 @@ namespace InphicBatteryTray
                         failStreak = 0;
                         Thread.Sleep(10);
                         Array.Clear(resp, 0, resp.Length);
+                        resp[0] = 0x0C;
                         if (!Native.HidD_GetFeature(h, resp, resp.Length))
                         {
                             Log("IN9 GetFeature FAILED err=" + Marshal.GetLastWin32Error());
@@ -905,7 +1065,6 @@ namespace InphicBatteryTray
                     Thread.Sleep(2500);
                 }
             }
-            catch (ThreadInterruptedException) { }
             catch (Exception ex) { Log("IN9 loop exception: " + ex.Message); }
             finally { Native.CloseHandle(h); }
         }
@@ -915,19 +1074,11 @@ namespace InphicBatteryTray
             // 实测布局：(IN9 升级版)
             //   [0]=0x0C [1]=0x01 [2]=0x20(命令回显) [6]!=0 有效
             //   [8..0x0B]="M909" [0x0F]=IC [0x12]=电量 [0x13]==2 充电中 [0x15]=在线
-            bool echo = resp[2] == 0x20;
-            bool valid = resp[6] != 0;
-            int lv = -1;
-            if (echo && valid)
-            {
-                int v = resp[0x12];
-                if (v >= 0 && v <= 100) lv = v;
-            }
+            int lv = ParseIn9Battery(resp);
 
             if (lv < 0)
             {
-                Log("IN9 未认定电量 echo=0x" + resp[2].ToString("X2") + " flag=" + resp[6]
-                    + "  raw=" + Hex(resp, 33));
+                Log("IN9 invalid battery response: " + Hex(resp, resp == null ? 0 : resp.Length));
                 return;
             }
 
@@ -937,11 +1088,11 @@ namespace InphicBatteryTray
             lock (sync)
             {
                 DeviceState st;
-                if (!states.TryGetValue(label, out st))
+                if (!states.TryGetValue(dev.Path, out st))
                 {
                     st = new DeviceState();
                     st.Label = label;
-                    states[label] = st;
+                    states[dev.Path] = st;
                 }
                 if (st.LastSeen != DateTime.MinValue)
                     st.LastIntervalMs = (now - st.LastSeen).TotalMilliseconds;
@@ -959,10 +1110,9 @@ namespace InphicBatteryTray
                 if (changed || dump)
                     Log("IN9 battery " + lv + "%  charge=" + charge + "  [" + dev.Product + "]");
             }
-            UpdateTrayUI();
         }
 
-        static void ReadLoop(HidInterface dev)
+        static void ReadLoop(HidInterface dev, int generation)
         {
             string label = string.Format("{0:X4}:{1:X4}", dev.Vid, dev.Pid);
             if (!string.IsNullOrEmpty(dev.Product)) label = dev.Product + " [" + label + "]";
@@ -980,42 +1130,23 @@ namespace InphicBatteryTray
             if (h == Native.INVALID_HANDLE_VALUE) return;
             Log("opened: " + label);
 
-            IntPtr ev = Native.CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
-            var buf = new byte[256];
-            var ov = new Native.OVERLAPPED();
-            ov.hEvent = ev;
-            IntPtr ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.OVERLAPPED)));
+            var buf = new byte[dev.InLen];
 
             DateTime lastReport = DateTime.MinValue;
 
             try
             {
-                while (running)
+                while (running && generation == Thread.VolatileRead(ref readerGeneration))
                 {
-                    Marshal.StructureToPtr(ov, ovPtr, false);
-                    Native.ResetEvent(ev);
-                    int read = 0;
-                    bool ok = Native.ReadFile(h, buf, buf.Length, out read, ovPtr);
-                    int err = Marshal.GetLastWin32Error();
-                    if (!ok && err != Native.ERROR_IO_PENDING) break;
-
-                    uint rc = Native.WaitForSingleObject(ev, 3000);
-                    if (rc != Native.WAIT_OBJECT_0)
-                    {
-                        Native.CancelIoEx(h, ovPtr);
-                        continue;
-                    }
-                    int got = 0;
-                    if (!Native.GetOverlappedResult(h, ovPtr, out got, false)) continue;
-                    if (got <= 0) continue;
+                    int got = HidTransfer(h, buf, 3000, false);
+                    if (got < 0) break;
+                    if (got == 0) continue;
 
                     // 电量事件：0x40 / 0x41，第 4 字节是充电状态（不是设备号）
-                    if (buf[0] == 0x03 && TypeCodes.Contains(buf[1]) &&
-                        (buf[2] == 0x40 || buf[2] == 0x41) && got >= 5)
+                    int level = ParseIn10Battery(buf, got);
+                    if (level >= 0)
                     {
                         int charge = buf[3];
-                        int level = buf[4];
-                        if (level < 0 || level > 100) continue;
 
                         DateTime now = DateTime.Now;
                         double interval = 0;
@@ -1026,11 +1157,11 @@ namespace InphicBatteryTray
                         lock (sync)
                         {
                             DeviceState st;
-                            if (!states.TryGetValue(label, out st))
+                            if (!states.TryGetValue(dev.Path, out st))
                             {
                                 st = new DeviceState();
                                 st.Label = label;
-                                states[label] = st;
+                                states[dev.Path] = st;
                             }
                             st.Battery = level;
                             st.ChargeState = charge;
@@ -1043,18 +1174,14 @@ namespace InphicBatteryTray
                             st.TypeCode = buf[1];
                             if (interval > 0) st.LastIntervalMs = interval;
                         }
-                        UpdateTrayUI();
                         Log(string.Format("battery {0}%  charge={1}  {2:F0}ms  transport={3}  type=0x{4:X2}  [{5}]",
                             level, charge, interval, dev.Transport, buf[1], label));
                     }
                 }
             }
-            catch (ThreadInterruptedException) { }
-            catch (Exception) { }
+            catch (Exception ex) { Log("IN10 loop exception: " + ex.Message); }
             finally
             {
-                Marshal.FreeHGlobal(ovPtr);
-                Native.CloseHandle(ev);
                 Native.CloseHandle(h);
             }
         }
@@ -1062,6 +1189,7 @@ namespace InphicBatteryTray
         static void TickStatus()
         {
             int level = -1;
+            int charge = -1;
             DateTime newest = DateTime.MinValue;
             double interval = 0;
 
@@ -1073,6 +1201,7 @@ namespace InphicBatteryTray
                     {
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
+                        charge = kv.Value.ChargeState;
                         interval = kv.Value.LastIntervalMs;
                     }
                 }
@@ -1081,10 +1210,10 @@ namespace InphicBatteryTray
             bool offline = (newest == DateTime.MinValue) ||
                            ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
 
-            RefreshTray(level, interval, offline, newest);
+            RefreshTray(level, interval, offline, newest, charge);
         }
 
-        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen)
+        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen, int charge)
         {
             if (level != lastDrawnLevel || offline != lastDrawnOffline)
             {
@@ -1099,46 +1228,35 @@ namespace InphicBatteryTray
 
             string tip;
             if (level < 0)
-                tip = "英菲克：未检测到设备";
+                tip = "鼠标电量：未检测到设备";
             else if (offline)
-                tip = string.Format("英菲克：已断开 / 已关机（最后 {0}%，{1:HH:mm:ss}）",
+                tip = string.Format("鼠标：暂无回应（最后 {0}%，{1:HH:mm:ss}）",
                     level, lastSeen);
+            else if (interval > 0)
+                tip = string.Format("鼠标电量 {0}%  ({1:F0}ms 刷新)", level, interval);
             else
-                tip = string.Format("英菲克 电量 {0}%  ({1:F0}ms 刷新)", level, interval);
+                tip = string.Format("鼠标电量 {0}%", level);
 
+            if (!offline && level >= 0 && charge == 3) tip += "  充电中";
             if (tip.Length > 127) tip = tip.Substring(0, 127);
             tray.Text = tip;
         }
 
-        static void UpdateTrayUI()
-        {
-            int level = -1;
-            double interval = 0;
-            DateTime newest = DateTime.MinValue;
-            lock (sync)
-            {
-                foreach (var kv in states)
-                {
-                    if (kv.Value.LastSeen > newest)
-                    {
-                        newest = kv.Value.LastSeen;
-                        level = kv.Value.Battery;
-                        interval = kv.Value.LastIntervalMs;
-                    }
-                }
-            }
-            if (level < 0) return;
-
-            bool offline = ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
-            RefreshTray(level, interval, offline, newest);
-        }
     }
 
     // 轻量信息浮层：不抢焦点、不阻塞，鼠标移开自动消失
     class InfoPopup : Form
     {
         System.Windows.Forms.Timer lifeTimer;
+        readonly Font detailFont = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
         int countdown;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && lifeTimer != null) lifeTimer.Dispose();
+            base.Dispose(disposing);
+            if (disposing) detailFont.Dispose();
+        }
 
         protected override bool ShowWithoutActivation { get { return true; } }
 
@@ -1165,7 +1283,7 @@ namespace InphicBatteryTray
             lbl.Dock = DockStyle.Fill;
             lbl.Text = text;
             lbl.ForeColor = Color.FromArgb(236, 236, 242);
-            lbl.Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            lbl.Font = detailFont;
             lbl.TextAlign = ContentAlignment.TopLeft;
             lbl.BackColor = Color.Transparent;
             Controls.Add(lbl);

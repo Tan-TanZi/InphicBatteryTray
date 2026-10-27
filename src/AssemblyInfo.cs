@@ -1,7 +1,7 @@
 using System.Reflection;
 
 [assembly: AssemblyTitle("Inphic Battery Tray")]
-[assembly: AssemblyDescription("Taskbar battery indicator for INPHIC wireless mice (IN10 + IN9)")]
+[assembly: AssemblyDescription("Taskbar battery indicator for INPHIC (IN10 + IN9) and ATK X1 Pro 1K wireless mice")]
 [assembly: AssemblyProduct("InphicBatteryTray")]
 [assembly: AssemblyCompany("Tan-TanZi")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Tan-TanZi")]
