@@ -65,8 +65,11 @@ namespace InphicBatteryTray
                 Check(Program.ParseAtkBattery(reply, 17) == -1, "Reject another report ID");
                 reply[0] = 8; reply[1] = 5; reply[16] -= 6;
                 Check(Program.ParseAtkBattery(reply, 17) == -1, "Reject another command");
-                Check(Program.QueryAtkBattery(Native.INVALID_HANDLE_VALUE, Receiver()) == -1,
+                int charge;
+                Check(Program.QueryAtkBattery(Native.INVALID_HANDLE_VALUE, Receiver(), out charge) == -1 && charge == -1,
                     "A failed write must not produce a reading");
+                CheckAtkCharging();
+                CheckChargingTooltip();
                 CheckInphic();
                 CheckReadCancellation();
                 CheckReaderLifecycle();
@@ -94,6 +97,66 @@ namespace InphicBatteryTray
                 var elapsed = System.Diagnostics.Stopwatch.StartNew();
                 Program.Main(new string[0]);
                 Check(elapsed.ElapsedMilliseconds < 1000, "A second instance must exit promptly without opening a tray");
+            }
+        }
+
+        static void CheckAtkCharging()
+        {
+            byte[] battery = new byte[] { 8, 4, 0, 0, 0, 2, 30, 0, 14, 90, 0, 0, 0, 0, 0, 0, 193 };
+            byte[] charging = new byte[] { 8, 4, 0, 0, 0, 2, 50, 1, 15, 31, 0, 0, 0, 0, 0, 0, 230 };
+            Check(Program.ParseAtkCharge(battery, 17) == 1, "Real battery-powered capture is not charging");
+            Check(Program.ParseAtkBattery(charging, 17) == 50 && Program.ParseAtkCharge(charging, 17) == 3,
+                "Real charging capture retains percentage and exposes the charging flag");
+            Check(Program.ParseAtkCharge(charging, 7) == -1, "Never parse charging from partial data");
+            Check(Program.ParseAtkCharge(null, 17) == -1, "Never parse charging from missing data");
+            charging[16]++;
+            Check(Program.ParseAtkCharge(charging, 17) == -1, "A corrupt report must not update charging state");
+            charging[16] -= 2; charging[7] = 2;
+            Check(Program.ParseAtkBattery(charging, 17) == 50 && Program.ParseAtkCharge(charging, 17) == -1,
+                "An unknown charging flag must stay unknown without discarding valid battery data");
+            charging[7] = 1; charging[16]++;
+            SetLevel(charging, 100);
+            Check(Program.ParseAtkCharge(charging, 17) == 3,
+                "A 100 percent reading alone must not invent an unverified charge-complete flag");
+        }
+
+        static void CheckChargingTooltip()
+        {
+            var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+            var trayField = typeof(Program).GetField("tray", flags);
+            var iconField = typeof(Program).GetField("currentIcon", flags);
+            var states = (System.Collections.Generic.Dictionary<string, DeviceState>)
+                typeof(Program).GetField("states", flags).GetValue(null);
+            var tick = typeof(Program).GetMethod("TickStatus", flags);
+            using (var tray = new System.Windows.Forms.NotifyIcon())
+            {
+                try
+                {
+                    trayField.SetValue(null, tray);
+                    var state = new DeviceState { Battery = 50, ChargeState = 3, LastSeen = DateTime.Now };
+                    states.Add("test-ATK", state);
+                    tick.Invoke(null, null);
+                    Check(tray.Text.Contains("50%") && tray.Text.Contains("充电中"),
+                        "The actual tray tooltip must display charging");
+                    state.ChargeState = 1;
+                    tick.Invoke(null, null);
+                    Check(!tray.Text.Contains("充电中"), "Unplugging must clear charging even at the same percentage");
+                    state.ChargeState = -1;
+                    tick.Invoke(null, null);
+                    Check(!tray.Text.Contains("充电中"), "An unknown flag must not claim charging");
+                    state.ChargeState = 3; state.LastSeen = DateTime.Now.AddSeconds(-9);
+                    tick.Invoke(null, null);
+                    Check(tray.Text.Contains("暂无回应") && !tray.Text.Contains("充电中"),
+                        "Stale charging data must not be presented as a current charge");
+                }
+                finally
+                {
+                    states.Clear();
+                    trayField.SetValue(null, null);
+                    var icon = iconField.GetValue(null) as System.Drawing.Icon;
+                    if (icon != null) icon.Dispose();
+                    iconField.SetValue(null, null);
+                }
             }
         }
 
@@ -253,9 +316,10 @@ namespace InphicBatteryTray
                 {
                     for (int i = 0; i < 3; i++)
                     {
-                        int level = Program.QueryAtkBattery(handle, dev);
+                        int charge;
+                        int level = Program.QueryAtkBattery(handle, dev, out charge);
                         Check(level >= 0, "No valid ATK battery reply; wake the mouse and close exclusive vendor tools");
-                        Console.WriteLine("ATK battery: " + level + "%");
+                        Console.WriteLine("ATK battery: " + level + "% charge=" + charge);
                         if (i < 2) System.Threading.Thread.Sleep(2500);
                     }
                 }

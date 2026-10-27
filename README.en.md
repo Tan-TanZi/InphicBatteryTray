@@ -12,7 +12,8 @@ No driver patching, DLL injection, or device configuration changes. IN10 listens
 - Queries run about **2.5 seconds** after each valid reply. Report length, command, percentage range and checksum are validated. After 8 seconds without valid data, the icon greys out and retains the last reading.
 - Only the 17-byte vendor battery collection, `Usage Page 0xFF02 / Usage 0x0002`, is accessed; no mouse movement or keystrokes are read.
 - A second launch exits immediately to prevent duplicate polling. Manual rescans wake the supervisor and reopen interfaces after old reads finish; receivers of the same model keep separate states.
-- Idle timeouts have been checked: the icon greys out and keeps the last reading. The tooltip says "no response" rather than treating sleep as a confirmed power-off. Charging remains unknown. Wired mode, 8K receivers, Bluetooth and other ATK models are not supported. Power-off, unplug/replug, sleep recovery and coexistence with ATK HUB have not been checked on hardware.
+- The charging flag was checked on hardware while powered by a charger, after unplugging the charging cable, and after reconnecting it. It is read through the 1K receiver. The tooltip and details show charging; unplugging clears it. Unknown flags stay unknown, and 100% alone does not imply charging is complete.
+- Idle timeouts have been checked: the icon greys out and keeps the last reading. The tooltip says "no response" rather than treating sleep as a confirmed power-off; stale charging data is marked as the last recorded state in details. USB wired data mode, 8K receivers, Bluetooth and other ATK models are not supported. Power-off, receiver unplug/replug, sleep recovery and coexistence with ATK HUB have not been checked on hardware.
 - Build this branch and run `InphicBatteryTray.exe`; the upstream release binary does not include this adaptation.
 
 Run checks without a test framework:

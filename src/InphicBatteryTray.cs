@@ -677,7 +677,7 @@ namespace InphicBatteryTray
                             sb.AppendLine(string.Format("  协议族    : type 0x{0:X2}", d.TypeCode));
                         sb.AppendLine("  协议      : " + (string.IsNullOrEmpty(d.Protocol) ? "未知" : d.Protocol));
                         sb.AppendLine("  电量      : " + d.Battery + "%");
-                        sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState));
+                        sb.AppendLine("  充电状态  : " + ChargeText(d.ChargeState) + (off ? "（最后记录）" : ""));
                         sb.AppendLine("  刷新间隔  : " + (d.LastIntervalMs > 0
                             ? string.Format("{0:F0} ms", d.LastIntervalMs) : "等待下一次读取"));
                         sb.AppendLine(string.Format("  最后上报  : {0:HH:mm:ss}", d.LastSeen));
@@ -764,8 +764,18 @@ namespace InphicBatteryTray
             return response[6];
         }
 
-        internal static int QueryAtkBattery(IntPtr handle, HidInterface dev)
+        internal static int ParseAtkCharge(byte[] response, int count)
         {
+            if (ParseAtkBattery(response, count) < 0) return -1;
+            // 实机拔线/充电器供电对照：byte 7 为 0 / 1；不根据百分比推断充满。
+            if (response[7] == 0) return 1;
+            if (response[7] == 1) return 3;
+            return -1;
+        }
+
+        internal static int QueryAtkBattery(IntPtr handle, HidInterface dev, out int charge)
+        {
+            charge = -1;
             if (!IsAtk(dev)) return -1;
             // ATK/Compx Nordic52 电量查询；17 字节之和为 0x55。
             byte[] request = new byte[17];
@@ -786,7 +796,11 @@ namespace InphicBatteryTray
                 if (count <= 0) break;
                 Log("ATK rx: " + Hex(response, count));
                 int level = ParseAtkBattery(response, count);
-                if (level >= 0) return level;
+                if (level >= 0)
+                {
+                    charge = ParseAtkCharge(response, count);
+                    return level;
+                }
             }
             Log("ATK no valid battery reply");
             return -1;
@@ -809,7 +823,8 @@ namespace InphicBatteryTray
                 int failures = 0;
                 while (running && generation == Thread.VolatileRead(ref readerGeneration))
                 {
-                    int level = QueryAtkBattery(handle, dev);
+                    int charge;
+                    int level = QueryAtkBattery(handle, dev, out charge);
                     if (!running || generation != Thread.VolatileRead(ref readerGeneration)) break;
                     if (level < 0)
                     {
@@ -836,9 +851,10 @@ namespace InphicBatteryTray
                             if (state.LastSeen != DateTime.MinValue)
                                 state.LastIntervalMs = (now - state.LastSeen).TotalMilliseconds;
                             state.Battery = level;
+                            state.ChargeState = charge;
                             state.LastSeen = now;
                         }
-                        Log("ATK battery " + level + "%");
+                        Log("ATK battery " + level + "% charge=" + charge);
                     }
                     Thread.Sleep(2500);
                 }
@@ -1151,6 +1167,7 @@ namespace InphicBatteryTray
         static void TickStatus()
         {
             int level = -1;
+            int charge = -1;
             DateTime newest = DateTime.MinValue;
             double interval = 0;
 
@@ -1162,6 +1179,7 @@ namespace InphicBatteryTray
                     {
                         newest = kv.Value.LastSeen;
                         level = kv.Value.Battery;
+                        charge = kv.Value.ChargeState;
                         interval = kv.Value.LastIntervalMs;
                     }
                 }
@@ -1170,10 +1188,10 @@ namespace InphicBatteryTray
             bool offline = (newest == DateTime.MinValue) ||
                            ((DateTime.Now - newest).TotalMilliseconds > OfflineAfterMs);
 
-            RefreshTray(level, interval, offline, newest);
+            RefreshTray(level, interval, offline, newest, charge);
         }
 
-        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen)
+        static void RefreshTray(int level, double interval, bool offline, DateTime lastSeen, int charge)
         {
             if (level != lastDrawnLevel || offline != lastDrawnOffline)
             {
@@ -1197,6 +1215,7 @@ namespace InphicBatteryTray
             else
                 tip = string.Format("鼠标电量 {0}%", level);
 
+            if (!offline && level >= 0 && charge == 3) tip += "  充电中";
             if (tip.Length > 127) tip = tip.Substring(0, 127);
             tray.Text = tip;
         }
