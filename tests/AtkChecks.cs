@@ -69,6 +69,7 @@ namespace InphicBatteryTray
                 Check(Program.QueryAtkBattery(Native.INVALID_HANDLE_VALUE, Receiver(), out charge) == -1 && charge == -1,
                     "A failed write must not produce a reading");
                 CheckAtkCharging();
+                CheckCalibrationCapture();
                 CheckChargingTooltip();
                 CheckInphic();
                 CheckReadCancellation();
@@ -118,6 +119,49 @@ namespace InphicBatteryTray
             SetLevel(charging, 100);
             Check(Program.ParseAtkCharge(charging, 17) == 3,
                 "A 100 percent reading alone must not invent an unverified charge-complete flag");
+        }
+
+        static void CheckCalibrationCapture()
+        {
+            string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid() + ".csv");
+            var field = typeof(Program).GetField("calibrationPath",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            object previous = field.GetValue(null);
+            byte[] reply = new byte[] { 8, 4, 0, 0, 0, 2, 50, 1, 15, 31, 0, 0, 0, 0, 0, 0, 230 };
+            var dev = Receiver();
+            dev.Path = "test, \"receiver\"";
+            try
+            {
+                field.SetValue(null, path);
+                Program.RecordAtkCalibration(dev, reply, 7);
+                Check(!System.IO.File.Exists(path), "Partial data must not enter calibration samples");
+                Program.RecordAtkCalibration(dev, reply, 17);
+                Program.RecordAtkCalibration(dev, reply, 17);
+                string[] lines = System.IO.File.ReadAllLines(path);
+                Check(lines.Length == 3 && lines[0].StartsWith("utc,device_path,"), "Append samples with one CSV header");
+                Check(lines[1].Contains(",\"test, \"\"receiver\"\"\",50,1,3871,"),
+                    "Keep the original percent, charging flag, millivolts and escaped receiver identity");
+                Check(lines[1].EndsWith(BitConverter.ToString(reply)), "Keep the raw packet for later analysis");
+                DateTime timestamp = DateTime.Parse(lines[1].Substring(0, lines[1].IndexOf(',')),
+                    System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind);
+                Check(timestamp.Kind == DateTimeKind.Utc, "Calibration timestamps must include the UTC date across midnight");
+                reply[16]++;
+                Program.RecordAtkCalibration(dev, reply, 17);
+                Check(System.IO.File.ReadAllLines(path).Length == 3, "Reject corrupt calibration samples");
+                field.SetValue(null, null);
+                reply[16]--;
+                Program.RecordAtkCalibration(dev, reply, 17);
+                Check(System.IO.File.ReadAllLines(path).Length == 3, "Capture must be opt-in");
+                field.SetValue(null, path + "\\missing\\samples.csv");
+                Program.RecordAtkCalibration(dev, reply, 17);
+                Check(System.IO.File.ReadAllLines(path).Length == 3,
+                    "A capture write failure must return normally and preserve previous samples");
+            }
+            finally
+            {
+                field.SetValue(null, previous);
+                if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+            }
         }
 
         static void CheckChargingTooltip()

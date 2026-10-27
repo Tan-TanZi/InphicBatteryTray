@@ -1,5 +1,6 @@
 /InphicBatteryTray.exe
 /tray.log*
+/atk-calibration*.csv
 /tests/AtkChecks.exe
 /.superpowers/
 /docs/superpowers/

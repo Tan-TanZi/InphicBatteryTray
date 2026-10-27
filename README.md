@@ -24,6 +24,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1 -Probe
 ```
 
+需要采集电量校准数据时，先退出已有托盘，再运行：
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\InphicBatteryTray" | Out-Null
+.\InphicBatteryTray.exe "--calibration=$env:LOCALAPPDATA\InphicBatteryTray\atk-calibration.csv"
+```
+
+此参数仅记录通过校验的 ATK 报文：UTC 日期时间、接收器路径、原始百分比、充电标志、电压和原始数据，不修改显示值或设备配置。CSV 追加保存，不随诊断日志清空；连续有效回应时约 10 MB/天，退出程序即停止，重启时不带参数即可关闭采集。数据只保存在指定的本地文件中，不会自动上传。充电百分比可能随插拔和电压变化而跳变；采集功能尚不提供经过验证的电量补偿。
+
 托盘里的实际效果：
 
 ![实际效果](assets/a1.png)

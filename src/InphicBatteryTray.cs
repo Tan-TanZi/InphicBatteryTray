@@ -285,6 +285,7 @@ namespace InphicBatteryTray
         static NotifyIcon tray;
         static Icon currentIcon;
         static string logPath = null;
+        static string calibrationPath;
         static readonly object logSync = new object();
         static Bitmap srcIcon = null;
         static MenuItem autoItem;
@@ -331,6 +332,7 @@ namespace InphicBatteryTray
             foreach (string a in args)
             {
                 if (a.StartsWith("--log=")) logPath = a.Substring(6);
+                if (a.StartsWith("--calibration=")) calibrationPath = a.Substring(14);
             }
             if (logPath == null)
             {
@@ -773,6 +775,25 @@ namespace InphicBatteryTray
             return -1;
         }
 
+        internal static void RecordAtkCalibration(HidInterface dev, byte[] response, int count)
+        {
+            if (string.IsNullOrEmpty(calibrationPath) || !IsAtk(dev) || ParseAtkBattery(response, count) < 0) return;
+            lock (logSync)
+            {
+                try
+                {
+                    bool header = !File.Exists(calibrationPath) || new FileInfo(calibrationPath).Length == 0;
+                    string row = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "{0:o},\"{1}\",{2},{3},{4},{5}\r\n", DateTime.UtcNow,
+                        (dev.Path ?? "").Replace("\"", "\"\""), response[6], response[7],
+                        response[8] * 256 + response[9], BitConverter.ToString(response, 0, count));
+                    File.AppendAllText(calibrationPath, (header
+                        ? "utc,device_path,battery_percent,charging_flag,voltage_mv,packet\r\n" : "") + row);
+                }
+                catch (Exception ex) { Log("ATK calibration write failed: " + ex.Message); }
+            }
+        }
+
         internal static int QueryAtkBattery(IntPtr handle, HidInterface dev, out int charge)
         {
             charge = -1;
@@ -799,6 +820,7 @@ namespace InphicBatteryTray
                 if (level >= 0)
                 {
                     charge = ParseAtkCharge(response, count);
+                    RecordAtkCalibration(dev, response, count);
                     return level;
                 }
             }

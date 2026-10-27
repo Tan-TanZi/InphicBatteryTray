@@ -24,6 +24,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1 -Probe
 ```
 
+To collect calibration data, exit the existing tray first, then run:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\InphicBatteryTray" | Out-Null
+.\InphicBatteryTray.exe "--calibration=$env:LOCALAPPDATA\InphicBatteryTray\atk-calibration.csv"
+```
+
+This optional flag records validated ATK replies: UTC date/time, receiver path, raw percentage, charging flag, millivolts and raw packet. It changes neither the displayed percentage nor device settings. The CSV is append-only and is separate from the bounded diagnostic log; continuous replies use roughly 10 MB/day. Exit to stop recording and restart without the flag to disable it. Data stays in the specified local file and is never uploaded automatically. Charging percentages can jump with cable and voltage changes; this capture feature does not yet provide validated battery compensation.
+
 In the actual notification area:
 
 ![In the tray](assets/a1.png)
